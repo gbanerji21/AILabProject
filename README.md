@@ -22,6 +22,7 @@ ML-based pipeline for automatic generation of dental retainers from 3D tooth mes
 - Python 3.8+
 - CUDA 11.0+ (for GPU acceleration)
 - Git LFS (for large model/data files)
+- 3D Slicer
 
 ### Installation
 
@@ -44,7 +45,11 @@ pip install -r requirements.txt
 ```
 
 ## Usage
-
+### File Conversion
+Run the following command in the 3D Slicer Python Console using the path you put the project in (this could look different based on whether or not you are on windows, mac or linux.
+```
+exec(open('/path/to//project/slicerconversion.py').read())
+```
 ### Training
 
 ```bash
