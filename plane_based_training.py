@@ -2319,18 +2319,18 @@ def main():
 
     args = parser.parse_args()
 
-    POINTNET_BEFORE = "/home/garvb/Downloads/Pointnet Training Data/Before"
-    POINTNET_AFTER = "/home/garvb/Downloads/Pointnet Training Data/After"
+    POINTNET_BEFORE = "/home/garvb/AILabProject/Pointnet Training Data/Before"
+    POINTNET_AFTER = "/home/garvb/AILabProject/Pointnet Training Data/After"
     # Angle prediction uses clean rotation-only dataset (no cutting confounding)
-    ANGLE_BEFORE = "/home/garvb/Downloads/Angle Predictor Training Data/Before"
-    ANGLE_AFTER = "/home/garvb/Downloads/Angle Predictor Training Data/After"
+    ANGLE_BEFORE = "/home/garvb/AILabProject/Angle Predictor Training Data/Before"
+    ANGLE_AFTER = "/home/garvb/AILabProject/Angle Predictor Training Data/After"
 
     # Plane prediction uses full dataset with cutting (both upper and lower)
     # Separate upper and lower training directories
-    UPPER_BEFORE = "/home/garvb/Downloads/Plane Predictor Training Data/Upper_Before"
-    UPPER_AFTER = "/home/garvb/Downloads/Plane Predictor Training Data/Upper_After"
-    LOWER_BEFORE = "/home/garvb/Downloads/Plane Predictor Training Data/Lower_Before"
-    LOWER_AFTER = "/home/garvb/Downloads/Plane Predictor Training Data/Lower_After"
+    UPPER_BEFORE = "/home/garvb/AILabProject/Plane Predictor Training Data/Upper_Before"
+    UPPER_AFTER = "/home/garvb/AILabProject/Plane Predictor Training Data/Upper_After"
+    LOWER_BEFORE = "/home/garvb/AILabProject/Plane Predictor Training Data/Lower_Before"
+    LOWER_AFTER = "/home/garvb/AILabProject/Plane Predictor Training Data/Lower_After"
     ANGLES_NPZ = "/home/garvb/AILabProject/angle_predictions.npz"
 
     if args.back_cuts == 1:
