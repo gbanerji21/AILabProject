@@ -1,14 +1,15 @@
 """
-Unified Training Pipeline: Stage 1 (Angle Prediction) + Phase 1 (PointNet) + Phase 2 (Vertex Classifier)
-Stage 1: Predicts rotation angle for arch alignment
-Phase 1: Classifies mesh vertices as upper/lower/discard
-Phase 2: Per-vertex classification (keep/remove) with plane fitting post-processing
+Unified Training Pipeline: DGCNN + Data Augmentation for Distance Prediction
+- Uses DGCNN for superior local geometry learning vs PointNet
+- Regional models (left/right asymmetry) for accurate asymmetric cutting
+- Data augmentation to expand effective training set
+- Consensus extraction for robust ground truth
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 import trimesh
 import numpy as np
 import os
@@ -19,53 +20,175 @@ from scipy.spatial import cKDTree
 import argparse
 
 
-# ==================== SCALAR DISTANCE REGRESSOR ====================
+# ==================== DATA AUGMENTATION ====================
 
-class DistanceRegressor(nn.Module):
-    """Simple PointNet-style regressor for predicting 4 cutting distances: [Z, X_L, X_R, Y_B]"""
+def augment_point_cloud(points, rotation_range=15.0, scale_range=(0.9, 1.1), noise_scale=0.01):
+    """Apply random augmentation to point cloud.
 
-    def __init__(self, num_points=1000):
+    Args:
+        points: (N, 3) point cloud
+        rotation_range: Max rotation in degrees (applied to X, Y only, Z fixed at 0)
+        scale_range: Tuple of (min_scale, max_scale)
+        noise_scale: Gaussian noise std relative to point cloud scale
+
+    Returns:
+        augmented: (N, 3) augmented point cloud
+    """
+    augmented = points.copy()
+
+    # Random rotation (X and Y axes only, constrain Z to 0 like registration)
+    angles = np.random.uniform(-rotation_range, rotation_range, 2)
+    angles_rad = np.deg2rad(angles)
+
+    # Rotation around X
+    Rx = np.array([
+        [1, 0, 0],
+        [0, np.cos(angles_rad[0]), -np.sin(angles_rad[0])],
+        [0, np.sin(angles_rad[0]), np.cos(angles_rad[0])]
+    ])
+
+    # Rotation around Y
+    Ry = np.array([
+        [np.cos(angles_rad[1]), 0, np.sin(angles_rad[1])],
+        [0, 1, 0],
+        [-np.sin(angles_rad[1]), 0, np.cos(angles_rad[1])]
+    ])
+
+    augmented = augmented @ (Ry @ Rx).T
+
+    # Random scaling
+    scale = np.random.uniform(scale_range[0], scale_range[1])
+    augmented = augmented * scale
+
+    # Random noise
+    centroid = augmented.mean(axis=0)
+    centered = augmented - centroid
+    max_dist = np.max(np.linalg.norm(centered, axis=1))
+    if max_dist > 0:
+        noise = np.random.normal(0, noise_scale * max_dist, augmented.shape)
+        augmented = augmented + noise
+
+    return augmented
+
+
+# ==================== DGCNN DISTANCE REGRESSOR ====================
+
+class DGCNNDistanceRegressor(nn.Module):
+    """DGCNN-based distance regressor using dynamic graph convolutions.
+
+    Superior to PointNet for learning local geometry patterns needed for
+    accurate distance predictions. Processes left/right regions separately
+    to capture asymmetric cutting patterns.
+    """
+
+    def __init__(self, num_points=500, k=20, num_outputs=3):
         super().__init__()
         self.num_points = num_points
+        self.k = k
+        self.num_outputs = num_outputs
 
-        # Conv layers for feature extraction
-        self.conv1 = nn.Conv1d(3, 64, 1)
-        self.conv2 = nn.Conv1d(64, 128, 1)
-        self.conv3 = nn.Conv1d(128, 256, 1)
-        self.conv4 = nn.Conv1d(256, 512, 1)
+        # EdgeConv layers: learn local geometric relationships
+        self.edge_conv1 = self._edge_conv_layer(6, 64)
+        self.edge_conv2 = self._edge_conv_layer(128, 128)
+        self.edge_conv3 = self._edge_conv_layer(256, 256)
 
-        # Global MLP
-        self.fc1 = nn.Linear(512, 256)
-        self.fc2 = nn.Linear(256, 128)
-        self.fc3 = nn.Linear(128, 64)
-        self.fc_out = nn.Linear(64, 4)  # Output: [Z_cut, X_left, X_right, Y_back]
+        # Global feature extraction
+        self.fc_global1 = nn.Linear(256, 128)
+        self.fc_global2 = nn.Linear(128, 64)
+
+        # Per-region (left/right) branch for asymmetric cuts
+        self.fc_region1 = nn.Linear(256 + 64, 128)
+        self.fc_region2 = nn.Linear(128, 64)
+        self.fc_region_out = nn.Linear(64, 1)
+
+        # Global output for Z and X cuts
+        self.fc_out = nn.Linear(64, num_outputs - 1)  # Z and one X value
 
         self.dropout = nn.Dropout(0.3)
 
-    def forward(self, x):
-        """
+    def _edge_conv_layer(self, in_channels, out_channels):
+        return nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def get_edge_features(self, x, k):
+        """Extract edge features using k-NN with memory-efficient chunking."""
+        batch_size, num_points, _ = x.shape
+        device = x.device
+
+        all_knn_idx = []
+        for b in range(batch_size):
+            points = x[b]
+            chunk_size = 256
+            all_distances = []
+
+            for i in range(0, num_points, chunk_size):
+                chunk_end = min(i + chunk_size, num_points)
+                chunk = points[i:chunk_end]
+                diff = chunk.unsqueeze(1) - points.unsqueeze(0)
+                distances = torch.sum(diff ** 2, dim=2)
+                all_distances.append(distances)
+
+            distances = torch.cat(all_distances, dim=0)
+            _, knn = torch.topk(distances, k + 1, dim=1, largest=False)
+            knn = knn[:, 1:]
+            all_knn_idx.append(knn)
+
+        knn_idx = torch.stack(all_knn_idx)
+        batch_idx = torch.arange(batch_size, device=device).view(batch_size, 1, 1)
+        neighbors = x[batch_idx, knn_idx]
+
+        point_expanded = x.unsqueeze(2).expand(-1, -1, k, -1)
+        edge_feature = torch.cat([neighbors - point_expanded, neighbors], dim=3)
+
+        return edge_feature
+
+    def edge_conv(self, x, edge_conv_layer, k):
+        edge_feat = self.get_edge_features(x, k)
+        edge_feat = edge_feat.permute(0, 3, 1, 2)
+        out = edge_conv_layer(edge_feat)
+        out = torch.max(out, dim=3)[0]
+        out = out.permute(0, 2, 1)
+        return out
+
+    def forward(self, x, region='left'):
+        """Predict distances for a region (left or right).
+
         Args:
             x: (batch, num_points, 3)
+            region: 'left' or 'right'
+
         Returns:
-            distances: (batch, 4)
+            distances: (batch, num_outputs)
         """
-        # Conv features
-        x = x.transpose(2, 1)  # (batch, 3, num_points)
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
-        x = F.relu(self.conv4(x))
+        batch_size = x.size(0)
 
-        # Global max pooling
-        x = torch.max(x, dim=2)[0]  # (batch, 512)
+        # Edge convolutions
+        ec1 = self.edge_conv(x, self.edge_conv1, self.k)
+        ec2 = self.edge_conv(ec1, self.edge_conv2, self.k)
+        ec3 = self.edge_conv(ec2, self.edge_conv3, self.k)
 
-        # MLP regressor
-        x = F.relu(self.fc1(x))
-        x = self.dropout(x)
-        x = F.relu(self.fc2(x))
-        x = self.dropout(x)
-        x = F.relu(self.fc3(x))
-        distances = self.fc_out(x)  # (batch, 4)
+        # Global feature
+        global_feat = torch.max(ec3, dim=1)[0]
+        global_feat = F.relu(self.fc_global1(global_feat))
+        global_feat = self.dropout(global_feat)
+        global_feat = F.relu(self.fc_global2(global_feat))
+
+        # Global outputs (Z and X for this region)
+        global_out = F.relu(self.fc_out(global_feat))
+
+        # Per-region branch for Y_back
+        region_feat = torch.max(ec3, dim=1)[0]
+        region_combined = torch.cat([region_feat, global_feat], dim=1)
+        region_out = F.relu(self.fc_region1(region_combined))
+        region_out = self.dropout(region_out)
+        region_out = F.relu(self.fc_region2(region_out))
+        y_back = F.relu(self.fc_region_out(region_out))
+
+        # Combine: [Z, X, Y_back]
+        distances = torch.cat([global_out, y_back], dim=1)
 
         return distances
 
@@ -842,40 +965,95 @@ def extract_angle_prediction_dataset(before_dir, after_dir, output_npz_path):
 # ==================== PHASE 1: PointNet Classes ====================
 
 class ArchPointNet(nn.Module):
-    """PointNet for 3-class arch classification."""
+    """DGCNN-based arch classifier for 3-class segmentation (upper/lower/discard).
 
-    def __init__(self, num_points=1000, num_classes=3):
+    Uses edge convolutions to capture local geometric relationships, reducing
+    cross-class artifacts and improving boundary detection.
+    """
+
+    def __init__(self, num_points=1000, num_classes=3, k=20):
         super().__init__()
         self.num_points = num_points
+        self.num_classes = num_classes
+        self.k = k
 
-        self.conv1 = nn.Conv1d(3, 64, 1)
-        self.conv2 = nn.Conv1d(64, 128, 1)
-        self.conv3 = nn.Conv1d(128, 256, 1)
+        self.edge_conv1 = self._edge_conv_layer(6, 64)
+        self.edge_conv2 = self._edge_conv_layer(128, 128)
+        self.edge_conv3 = self._edge_conv_layer(256, 256)
 
-        self.fc1 = nn.Linear(256, 128)
-        self.fc2 = nn.Linear(128, 64)
+        self.fc1 = nn.Linear(256, 256)
+        self.fc2 = nn.Linear(256, 128)
 
-        self.fc_points = nn.Linear(64 + 256, 128)
+        self.fc_points = nn.Linear(128 + 256, 128)
         self.fc_out = nn.Linear(128, num_classes)
+
+    def _edge_conv_layer(self, in_channels, out_channels):
+        return nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def get_edge_features(self, x, k):
+        """Extract edge features using k-NN."""
+        batch_size, num_points, _ = x.shape
+        device = x.device
+
+        all_knn_idx = []
+        for b in range(batch_size):
+            points = x[b]
+            chunk_size = 256
+            all_distances = []
+
+            for i in range(0, num_points, chunk_size):
+                chunk_end = min(i + chunk_size, num_points)
+                chunk = points[i:chunk_end]
+                diff = chunk.unsqueeze(1) - points.unsqueeze(0)
+                distances = torch.sum(diff ** 2, dim=2)
+                all_distances.append(distances)
+
+            distances = torch.cat(all_distances, dim=0)
+            _, knn = torch.topk(distances, k + 1, dim=1, largest=False)
+            knn = knn[:, 1:]
+            all_knn_idx.append(knn)
+
+        knn_idx = torch.stack(all_knn_idx)
+
+        batch_idx = torch.arange(batch_size, device=device).view(batch_size, 1, 1)
+        neighbors = x[batch_idx, knn_idx]
+
+        point_expanded = x.unsqueeze(2).expand(-1, -1, k, -1)
+        edge_feature = torch.cat([
+            neighbors - point_expanded,
+            neighbors
+        ], dim=3)
+
+        return edge_feature
+
+    def edge_conv(self, x, edge_conv_layer, k):
+        edge_feat = self.get_edge_features(x, k)
+        edge_feat = edge_feat.permute(0, 3, 1, 2)
+        out = edge_conv_layer(edge_feat)
+        out = torch.max(out, dim=3)[0]
+        out = out.permute(0, 2, 1)
+        return out
 
     def forward(self, x):
         batch_size = x.size(0)
-        x = x.transpose(2, 1)
 
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
+        ec1 = self.edge_conv(x, self.edge_conv1, self.k)
+        ec2 = self.edge_conv(ec1, self.edge_conv2, self.k)
+        ec3 = self.edge_conv(ec2, self.edge_conv3, self.k)
 
-        global_feat = torch.max(x, dim=2)[0]
+        global_feat = torch.max(ec3, dim=1)[0]
         global_feat = F.relu(self.fc1(global_feat))
         global_feat = F.relu(self.fc2(global_feat))
 
-        x = x.transpose(2, 1)
         global_feat_expanded = global_feat.unsqueeze(1).expand(-1, self.num_points, -1)
-        x_combined = torch.cat([x, global_feat_expanded], dim=2)
+        combined = torch.cat([ec3, global_feat_expanded], dim=2)
 
-        x = F.relu(self.fc_points(x_combined))
-        logits = self.fc_out(x)
+        logits = F.relu(self.fc_points(combined))
+        logits = self.fc_out(logits)
 
         return logits
 
@@ -1254,25 +1432,336 @@ class AnglePredictionTrainer:
 
 # ==================== PHASE 2: CUTTING DISTANCE PREDICTOR ====================
 
-def extract_cutting_distances_from_planes(before_mesh, after_mesh, num_back_cuts=1):
-    """Extract cutting distances by comparing mesh bounds (bbox method).
-
-    Simple and robust: directly compares before/after bounding boxes to extract
-    how much material was removed from each direction. Immune to mesh rotation and
-    vertex correspondence issues since it only examines final bounds.
-    """
+def extract_method_vertex_extremes(before_mesh, after_mesh, region='left'):
+    """Method 1: Direct vertex extremes."""
     before_bounds = before_mesh.bounds
     after_bounds = after_mesh.bounds
+    x_center = (before_bounds[0][0] + before_bounds[1][0]) / 2
 
-    z_cut = max(0, before_bounds[1][2] - after_bounds[1][2])
-    x_left = max(0, after_bounds[0][0] - before_bounds[0][0])
-    x_right = max(0, before_bounds[1][0] - after_bounds[1][0])
-    y_back = max(0, before_bounds[1][1] - after_bounds[1][1])
+    distances = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    # Z-cut for UPPER teeth: measured from TOP (max Z decreases when material is removed)
+    distances[0] = max(0, before_bounds[1][2] - after_bounds[1][2])
 
-    if num_back_cuts == 1:
-        return z_cut, x_left, x_right, y_back
+    left_verts = after_mesh.vertices[after_mesh.vertices[:, 0] <= x_center]
+    right_verts = after_mesh.vertices[after_mesh.vertices[:, 0] > x_center]
+
+    if len(left_verts) > 0:
+        left_after_bounds = np.array([left_verts.min(axis=0), left_verts.max(axis=0)])
+        distances[1] = max(0, left_after_bounds[0][0] - before_bounds[0][0])
+
+    if len(right_verts) > 0:
+        right_after_bounds = np.array([right_verts.min(axis=0), right_verts.max(axis=0)])
+        distances[2] = max(0, before_bounds[1][0] - right_after_bounds[1][0])
+
+    if region == 'left' and len(left_verts) > 0:
+        y_min_left_after = np.min(left_verts[:, 1])
+        distances[3] = max(0, y_min_left_after - before_bounds[0][1])
+
+    if region == 'right' and len(right_verts) > 0:
+        y_min_right_after = np.min(right_verts[:, 1])
+        distances[5] = max(0, y_min_right_after - before_bounds[0][1])
+
+    return distances
+
+
+def extract_method_percentile(before_mesh, after_mesh, region='left'):
+    """Method 2: Percentile-based (original approach)."""
+    from scipy.spatial import cKDTree
+
+    before_verts = before_mesh.vertices
+    before_bounds = before_mesh.bounds
+    after_mesh_verts = after_mesh.vertices
+
+    x_center = (before_bounds[0][0] + before_bounds[1][0]) / 2
+
+    tree = cKDTree(after_mesh_verts)
+    distances_to_after, _ = tree.query(before_verts)
+    removed_mask = distances_to_after > 0.1
+
+    if region == 'left':
+        region_mask = before_verts[:, 0] <= x_center
     else:
-        return z_cut, x_left, x_right, y_back, y_back
+        region_mask = before_verts[:, 0] > x_center
+
+    removed_region_verts = before_verts[removed_mask & region_mask]
+    kept_region_verts = before_verts[~removed_mask & region_mask]
+
+    distances = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    # Z-cut for UPPER teeth: measured from TOP (max Z decreases when material is removed)
+    distances[0] = max(0, before_bounds[1][2] - after_mesh.bounds[1][2])
+
+    if len(kept_region_verts) == 0 or len(removed_region_verts) == 0:
+        return distances
+
+    if region == 'left':
+        removed_x_95 = np.percentile(removed_region_verts[:, 0], 95)
+        kept_x_5 = np.percentile(kept_region_verts[:, 0], 5)
+        distances[1] = removed_x_95 - kept_x_5
+    else:
+        removed_x_5 = np.percentile(removed_region_verts[:, 0], 5)
+        kept_x_95 = np.percentile(kept_region_verts[:, 0], 95)
+        distances[2] = kept_x_95 - removed_x_5
+
+    removed_y_95 = np.percentile(removed_region_verts[:, 1], 95)
+    kept_y_5 = np.percentile(kept_region_verts[:, 1], 5)
+    y_back = removed_y_95 - kept_y_5
+
+    if region == 'left':
+        distances[3] = y_back
+    else:
+        distances[5] = y_back
+
+    return distances
+
+
+def extract_boundary_based_cutting_distances(before_mesh, after_mesh, region='left', verbose=False):
+    """Extract cutting distances using consensus of multiple methods.
+
+    Runs three independent extraction methods and returns the median result:
+    1. Vertex Extremes: Direct bounds comparison
+    2. Percentile-based: Statistical distribution of removed vertices
+    3. Consensus: Takes median of both methods to eliminate outliers
+
+    Args:
+        before_mesh: Before trimesh
+        after_mesh: After trimesh
+        region: 'left' or 'right'
+        verbose: Print debugging info
+
+    Returns:
+        distances: [Z_cut, X_L, X_R, Y_B_left, Y_B_center, Y_B_right]
+    """
+    # Method 1: Vertex extremes
+    dist_method1 = extract_method_vertex_extremes(before_mesh, after_mesh, region)
+
+    # Method 2: Percentile-based
+    dist_method2 = extract_method_percentile(before_mesh, after_mesh, region)
+
+    # Consensus: Take median of both methods for robustness
+    distances = np.median(np.array([dist_method1, dist_method2]), axis=0).astype(np.float32)
+
+    if verbose:
+        x_val = distances[1] if region == 'left' else distances[2]
+        y_val = distances[3] if region == 'left' else distances[5]
+        print(f"    Z-cut: {distances[0]:.2f}, X-cut: {x_val:.2f}, Y-back: {y_val:.2f}")
+
+    return distances
+
+
+def extract_lower_cutting_dataset(lower_before_dir, lower_after_dir, output_npz_path):
+    """Extract cutting distances from LOWER teeth only (single bottom cut).
+
+    Lower teeth typically only need a Z-cut (bottom removal).
+
+    Args:
+        lower_before_dir: Path to lower before meshes
+        lower_after_dir: Path to lower after meshes
+        output_npz_path: Output path for lower dataset
+
+    Returns:
+        True if successful, False otherwise
+    """
+    results = []
+    print(f"\n[*] Extracting lower teeth cutting distances (Z-cut only)...")
+    print(f"[*] Single planar cut from bottom")
+    print(f"{'='*60}\n")
+    print(f"    Before: {lower_before_dir} (exists: {os.path.exists(lower_before_dir)})")
+    print(f"    After:  {lower_after_dir} (exists: {os.path.exists(lower_after_dir)})\n")
+
+    if os.path.exists(lower_before_dir) and os.path.exists(lower_after_dir):
+        lower_files = sorted([f for f in os.listdir(lower_before_dir) if f.endswith('.stl')])
+        lower_scan_ids = [f.replace('lower_before.stl', '').replace('_before.stl', '') for f in lower_files]
+        lower_scan_ids = sorted(lower_scan_ids, key=lambda x: int(x.replace('scan', '')))
+
+        if len(lower_scan_ids) == 0:
+            print(f"  [!] No lower teeth files found")
+            return False
+
+        for i, scan_id in enumerate(lower_scan_ids):
+            before_path = os.path.join(lower_before_dir, f"{scan_id}lower_before.stl")
+            after_path = os.path.join(lower_after_dir, f"{scan_id}lower_after.stl")
+
+            try:
+                before_mesh = trimesh.load(before_path, force='mesh', process=False)
+                after_mesh = trimesh.load(after_path, force='mesh', process=False)
+
+                # For lower teeth, extract only Z-cut (bottom plane)
+                before_bounds = before_mesh.bounds
+                after_bounds = after_mesh.bounds
+                z_cut = max(0, after_bounds[0][2] - before_bounds[0][2])
+                # Apply 0.85 scale factor to be less aggressive (preserve gums for wearability)
+                z_cut_scaled = z_cut * 0.85
+                # Store as single value
+                distances = np.array([z_cut_scaled], dtype=np.float32)
+
+                results.append({
+                    'scan_id': f"lower_{scan_id}",
+                    'before_verts': before_mesh.vertices,
+                    'distances': distances,
+                })
+
+                print(f"  [{i+1}/{len(lower_scan_ids)}] {scan_id}: Z={z_cut:6.2f}mm → {z_cut_scaled:6.2f}mm (scaled 0.85)")
+
+            except Exception as e:
+                print(f"  [{i+1}/{len(lower_scan_ids)}] {scan_id} - Error: {e}")
+
+        if results:
+            scan_ids_result = np.array([r['scan_id'] for r in results], dtype=object)
+            before_verts_list = np.array([r['before_verts'].copy() for r in results], dtype=object)
+            distances_array = np.array([r['distances'] for r in results], dtype=np.float32)
+
+            np.savez(
+                output_npz_path,
+                scan_ids=scan_ids_result,
+                before_verts_list=before_verts_list,
+                distances=distances_array,
+            )
+            print(f"\n[+] Extracted {len(results)} lower teeth distances → {output_npz_path}\n")
+            return True
+        else:
+            print(f"[!] No valid samples extracted")
+            return False
+    else:
+        print(f"  [!] Directories not found")
+        return False
+
+
+def extract_combined_cutting_dataset(upper_before_dir, upper_after_dir, lower_before_dir, lower_after_dir, output_npz_path, num_back_cuts=1):
+    """Extract and combine cutting distances from separated upper and lower teeth datasets.
+
+    Args:
+        upper_before_dir: Path to upper before meshes
+        upper_after_dir: Path to upper after meshes
+        lower_before_dir: Path to lower before meshes
+        lower_after_dir: Path to lower after meshes
+        output_npz_path: Output path for combined dataset
+        num_back_cuts: Number of back cuts (1 or 2)
+
+    Returns:
+        True if successful, False otherwise
+    """
+    results = []
+    num_params = 4 if num_back_cuts == 1 else 5
+    print(f"\n[*] Extracting {num_params} cutting distances from upper and lower teeth...")
+    print(f"[*] Using separated folder structure (Upper_Before, Upper_After, Lower_Before, Lower_After)")
+    print(f"{'='*60}\n")
+
+    # Extract upper teeth data
+    print(f"[*] Processing UPPER teeth...")
+    print(f"    Before: {upper_before_dir} (exists: {os.path.exists(upper_before_dir)})")
+    print(f"    After:  {upper_after_dir} (exists: {os.path.exists(upper_after_dir)})")
+
+    if os.path.exists(upper_before_dir) and os.path.exists(upper_after_dir):
+        upper_files = sorted([f for f in os.listdir(upper_before_dir) if f.endswith('.stl')])
+        upper_scan_ids = [f.replace('upper_before.stl', '').replace('_before.stl', '') for f in upper_files]
+        upper_scan_ids = sorted(upper_scan_ids, key=lambda x: int(x.replace('scan', '')))
+
+        for i, scan_id in enumerate(upper_scan_ids):
+            before_path = os.path.join(upper_before_dir, f"{scan_id}upper_before.stl")
+            after_path = os.path.join(upper_after_dir, f"{scan_id}upper_after.stl")
+
+            try:
+                before_mesh = trimesh.load(before_path, force='mesh', process=False)
+                after_mesh = trimesh.load(after_path, force='mesh', process=False)
+
+                if num_back_cuts == 1:
+                    z_cut, x_left, x_right, y_back = extract_cutting_distances_from_planes(
+                        before_mesh, after_mesh, num_back_cuts=1
+                    )
+                    distances = np.array([z_cut, x_left, x_right, y_back], dtype=np.float32)
+                else:
+                    z_cut, x_left, x_right, y_back_left, y_back_right = extract_cutting_distances_from_planes(
+                        before_mesh, after_mesh, num_back_cuts=2
+                    )
+                    distances = np.array([z_cut, x_left, x_right, y_back_left, y_back_right], dtype=np.float32)
+
+                results.append({
+                    'scan_id': f"upper_{scan_id}",
+                    'arch_type': 'upper',
+                    'before_verts': before_mesh.vertices,
+                    'distances': distances,
+                })
+
+                if num_back_cuts == 1:
+                    print(f"  [{i+1}/{len(upper_scan_ids)}] {scan_id}: Z={z_cut:6.2f}mm, X_L={x_left:6.2f}mm, X_R={x_right:6.2f}mm, Y_B={y_back:6.2f}mm")
+                else:
+                    print(f"  [{i+1}/{len(upper_scan_ids)}] {scan_id}: Z={z_cut:6.2f}mm, X_L={x_left:6.2f}mm, X_R={x_right:6.2f}mm, Y_BL={y_back_left:6.2f}mm, Y_BR={y_back_right:6.2f}mm")
+
+            except Exception as e:
+                print(f"  [{i+1}/{len(upper_scan_ids)}] {scan_id} - Error: {e}")
+    else:
+        print(f"  [!] Upper Before/After directories not found")
+
+    # Extract lower teeth data
+    print(f"\n[*] Processing LOWER teeth...")
+    print(f"    Before: {lower_before_dir} (exists: {os.path.exists(lower_before_dir)})")
+    print(f"    After:  {lower_after_dir} (exists: {os.path.exists(lower_after_dir)})")
+
+    if os.path.exists(lower_before_dir) and os.path.exists(lower_after_dir):
+        lower_files = sorted([f for f in os.listdir(lower_before_dir) if f.endswith('.stl')])
+        lower_scan_ids = [f.replace('lower_before.stl', '').replace('_before.stl', '') for f in lower_files]
+        lower_scan_ids = sorted(lower_scan_ids, key=lambda x: int(x.replace('scan', '')))
+
+        if len(lower_scan_ids) == 0:
+            print(f"  [!] No lower teeth files found in {lower_before_dir}")
+        else:
+            for i, scan_id in enumerate(lower_scan_ids):
+                before_path = os.path.join(lower_before_dir, f"{scan_id}lower_before.stl")
+                after_path = os.path.join(lower_after_dir, f"{scan_id}lower_after.stl")
+
+                try:
+                    before_mesh = trimesh.load(before_path, force='mesh', process=False)
+                    after_mesh = trimesh.load(after_path, force='mesh', process=False)
+
+                    if num_back_cuts == 1:
+                        z_cut, x_left, x_right, y_back = extract_cutting_distances_from_planes(
+                            before_mesh, after_mesh, num_back_cuts=1
+                        )
+                        z_cut_scaled = z_cut * 0.85
+                        distances = np.array([z_cut_scaled, 0, 0, 0], dtype=np.float32)
+                    else:
+                        z_cut, x_left, x_right, y_back_left, y_back_right = extract_cutting_distances_from_planes(
+                            before_mesh, after_mesh, num_back_cuts=2
+                        )
+                        z_cut_scaled = z_cut * 0.85
+                        distances = np.array([z_cut_scaled, 0, 0, 0], dtype=np.float32)
+
+                    results.append({
+                        'scan_id': f"lower_{scan_id}",
+                        'arch_type': 'lower',
+                        'before_verts': before_mesh.vertices,
+                        'distances': distances,
+                    })
+
+                    if num_back_cuts == 1:
+                        print(f"  [{i+1}/{len(lower_scan_ids)}] {scan_id}: Z={z_cut:6.2f}mm → {z_cut_scaled:6.2f}mm (scaled 0.85)")
+                    else:
+                        print(f"  [{i+1}/{len(lower_scan_ids)}] {scan_id}: Z={z_cut:6.2f}mm → {z_cut_scaled:6.2f}mm (scaled 0.85)")
+
+                except Exception as e:
+                    print(f"  [{i+1}/{len(lower_scan_ids)}] {scan_id} - Error: {e}")
+    else:
+        print(f"  [!] Lower Before/After directories not found")
+
+    if results:
+        # Build arrays
+        scan_ids_result = np.array([r['scan_id'] for r in results], dtype=object)
+        arch_types = np.array([r['arch_type'] for r in results], dtype=object)
+        before_verts_list = np.array([r['before_verts'].copy() for r in results], dtype=object)
+        distances_array = np.array([r['distances'] for r in results], dtype=np.float32)
+
+        np.savez(
+            output_npz_path,
+            scan_ids=scan_ids_result,
+            arch_types=arch_types,
+            before_verts_list=before_verts_list,
+            distances=distances_array,
+        )
+        print(f"\n[+] Extracted {len(results)} cutting distances (combined upper+lower) → {output_npz_path}\n")
+        return True
+    else:
+        print(f"[!] No valid samples extracted")
+        return False
 
 
 def extract_cutting_dataset(before_dir, after_dir, output_npz_path, num_back_cuts=1):
@@ -1345,38 +1834,22 @@ def extract_cutting_dataset(before_dir, after_dir, output_npz_path, num_back_cut
         return False
 
 
-class CuttingDistancePredictor(nn.Module):
-    """PointNet-based regression network predicting 4 (or 5) cutting distances."""
-
-    def __init__(self, num_points=1000, num_outputs=4):
-        super().__init__()
-        self.num_points = num_points
-        self.num_outputs = num_outputs
-
-        self.conv1 = nn.Conv1d(3, 64, 1)
-        self.conv2 = nn.Conv1d(64, 128, 1)
-        self.conv3 = nn.Conv1d(128, 256, 1)
-
-        self.fc1 = nn.Linear(256, 128)
-        self.fc2 = nn.Linear(128, 64)
-        self.fc_out = nn.Linear(64, num_outputs)
-
-    def forward(self, x):
-        x = x.transpose(2, 1)
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
-        x = torch.max(x, dim=2)[0]
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        return self.fc_out(x)
+# (Removed old PointNet-based CuttingDistancePredictor - use DGCNNDistanceRegressor instead)
 
 
 class CuttingDistanceDataset(Dataset):
-    """Dataset for cutting distance prediction."""
+    """Dataset for cutting distance prediction with data augmentation.
 
-    def __init__(self, distances_npz_path, num_points=1000):
+    Augmentation expands effective training set from N to ~5N by:
+    - Random rotations (X/Y axes, Z constrained like ICP registration)
+    - Random scaling (0.9-1.1x)
+    - Gaussian noise
+    """
+
+    def __init__(self, distances_npz_path, num_points=500, augment=True, num_augmentations=5):
         self.num_points = num_points
+        self.augment = augment
+        self.num_augmentations = num_augmentations if augment else 1
 
         if not os.path.exists(distances_npz_path):
             raise FileNotFoundError(f"Distances file not found: {distances_npz_path}")
@@ -1388,26 +1861,29 @@ class CuttingDistanceDataset(Dataset):
         self.num_outputs = self.distances.shape[1]
 
         print(f"[*] Cutting Distance Dataset: Loaded {len(self.scan_ids)} samples")
-        print(f"[*] Predicting {self.num_outputs} distances: ", end="")
-        if self.num_outputs == 4:
-            print("[Z-depth, X-left, X-right, Y-back]")
-        else:
-            print("[Z-depth, X-left, X-right, Y-back-left, Y-back-right]")
+        print(f"[*] Augmentation: {'ON (' + str(num_augmentations) + 'x)' if augment else 'OFF'}")
+        print(f"[*] Predicting {self.num_outputs} distances per region: [Z, X, Y_back]")
 
     def __len__(self):
-        return len(self.scan_ids)
+        return len(self.scan_ids) * self.num_augmentations
 
     def __getitem__(self, idx):
         try:
-            verts = self.before_verts_list[idx]
+            base_idx = idx // self.num_augmentations
+            verts = self.before_verts_list[base_idx]
 
             if len(verts) > self.num_points:
                 sample_indices = np.random.choice(len(verts), self.num_points, replace=False)
             else:
                 sample_indices = np.arange(len(verts))
 
-            sampled_verts = verts[sample_indices]
+            sampled_verts = verts[sample_indices].copy()
 
+            # Apply augmentation
+            if self.augment:
+                sampled_verts = augment_point_cloud(sampled_verts)
+
+            # Normalize
             centroid = sampled_verts.mean(axis=0)
             verts_centered = sampled_verts - centroid
             max_dist = np.max(np.linalg.norm(verts_centered, axis=1))
@@ -1416,7 +1892,7 @@ class CuttingDistanceDataset(Dataset):
             else:
                 verts_norm = verts_centered
 
-            distances = self.distances[idx]
+            distances = self.distances[base_idx]
 
             return torch.from_numpy(verts_norm).float(), torch.from_numpy(distances).float()
 
@@ -1426,13 +1902,16 @@ class CuttingDistanceDataset(Dataset):
 
 
 class CuttingDistanceTrainer:
-    """Trainer for cutting distance prediction."""
+    """Trainer for DGCNN-based cutting distance prediction with regional models."""
 
-    def __init__(self, model, device='cuda', lr=0.001, patience=15):
+    def __init__(self, model, device='cuda', lr=0.001, patience=15, region='left'):
         self.model = model.to(device)
         self.device = device
-        self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=10, gamma=0.5)
+        self.region = region
+        self.optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', factor=0.5, patience=5
+        )
         self.criterion = nn.MSELoss()
         self.history = {'train_loss': [], 'val_loss': [], 'val_mae': []}
         self.patience = patience
@@ -1442,8 +1921,9 @@ class CuttingDistanceTrainer:
     def train_epoch(self, train_loader):
         self.model.train()
         total_loss = 0
+        num_batches = 0
 
-        for points, distances in tqdm(train_loader, desc="Cutting Distance Training"):
+        for points, distances in tqdm(train_loader, desc=f"Training {self.region}"):
             if points is None:
                 continue
 
@@ -1451,38 +1931,37 @@ class CuttingDistanceTrainer:
             distances = distances.to(self.device)
 
             self.optimizer.zero_grad()
-            predicted = self.model(points)
+            predicted = self.model(points, region=self.region)
             loss = self.criterion(predicted, distances)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
 
             total_loss += loss.item()
+            num_batches += 1
 
-        return total_loss / max(len(train_loader), 1)
+        return total_loss / max(num_batches, 1)
 
     def validate(self, val_loader):
         self.model.eval()
         total_loss = 0
-        total_mae = 0
         num_batches = 0
 
         with torch.no_grad():
-            for points, distances in tqdm(val_loader, desc="Cutting Distance Validation"):
+            for points, distances in tqdm(val_loader, desc=f"Validating {self.region}"):
                 if points is None:
                     continue
 
                 points = points.to(self.device)
                 distances = distances.to(self.device)
 
-                predicted = self.model(points)
+                predicted = self.model(points, region=self.region)
                 loss = self.criterion(predicted, distances)
-                mae = torch.mean(torch.abs(predicted - distances))
 
                 total_loss += loss.item()
-                total_mae += mae.item()
                 num_batches += 1
 
-        return total_loss / max(num_batches, 1), total_mae / max(num_batches, 1)
+        return total_loss / max(num_batches, 1)
 
     def train(self, train_loader, val_loader, epochs=50, checkpoint_dir='checkpoints'):
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -1831,6 +2310,10 @@ def main():
     parser.add_argument("--skip-pointnet", action="store_true", help="Skip Phase 1 (PointNet) training")
     parser.add_argument("--skip-angle", action="store_true", help="Skip Stage 1 (Angle) training")
     parser.add_argument("--skip-cutting", action="store_true", help="Skip Phase 2 (Cutting Distance) training")
+    parser.add_argument("--regional-only", action="store_true", help="Train ONLY regional distance regressors (Phase 2C)")
+    parser.add_argument("--skip-lower", action="store_true", help="Skip lower teeth distance regressor training")
+    parser.add_argument("--lower-only", action="store_true", help="Train ONLY lower teeth distance regressor (skip upper/angle)")
+    parser.add_argument("--no-augment", action="store_true", help="Disable data augmentation for faster training")
     parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
     parser.add_argument("--back-cuts", type=int, default=1, choices=[1, 2], help="Number of back cuts (1 or 2)")
 
@@ -1842,9 +2325,12 @@ def main():
     ANGLE_BEFORE = "/home/garvb/Downloads/Angle Predictor Training Data/Before"
     ANGLE_AFTER = "/home/garvb/Downloads/Angle Predictor Training Data/After"
 
-    # Plane prediction uses full dataset with cutting
-    PLANE_BEFORE = "/home/garvb/Downloads/Plane Predictor Training Data/Before"
-    PLANE_AFTER = "/home/garvb/Downloads/Plane Predictor Training Data/After"
+    # Plane prediction uses full dataset with cutting (both upper and lower)
+    # Separate upper and lower training directories
+    UPPER_BEFORE = "/home/garvb/Downloads/Plane Predictor Training Data/Upper_Before"
+    UPPER_AFTER = "/home/garvb/Downloads/Plane Predictor Training Data/Upper_After"
+    LOWER_BEFORE = "/home/garvb/Downloads/Plane Predictor Training Data/Lower_Before"
+    LOWER_AFTER = "/home/garvb/Downloads/Plane Predictor Training Data/Lower_After"
     ANGLES_NPZ = "/home/garvb/AILabProject/angle_predictions.npz"
 
     if args.back_cuts == 1:
@@ -1902,79 +2388,179 @@ def main():
                 return
         else:
             print(f"[+] Using existing angles file: {ANGLES_NPZ}\n")
+
+        if os.path.exists(ANGLES_NPZ):
+            angle_dataset = AngleDataset(ANGLES_NPZ, num_points=1000)
+
+            if len(angle_dataset) == 0:
+                print(f"[!] No valid samples in angle dataset")
+            else:
+                train_size = int(0.8 * len(angle_dataset))
+                val_size = len(angle_dataset) - train_size
+
+                train_dataset, val_dataset = torch.utils.data.random_split(
+                    angle_dataset,
+                    [train_size, val_size],
+                    generator=torch.Generator().manual_seed(42)
+                )
+
+                def collate_angle_fn(batch):
+                    batch = [item for item in batch if item[0] is not None]
+                    if len(batch) == 0:
+                        return None, None
+                    points = torch.stack([item[0] for item in batch])
+                    angles = torch.stack([item[1] for item in batch])
+                    return points, angles
+
+                train_loader = DataLoader(
+                    train_dataset,
+                    batch_size=4,
+                    shuffle=True,
+                    num_workers=0,
+                    collate_fn=collate_angle_fn
+                )
+                val_loader = DataLoader(
+                    val_dataset,
+                    batch_size=4,
+                    shuffle=False,
+                    num_workers=0,
+                    collate_fn=collate_angle_fn
+                )
+
+                print(f"[*] Angle dataset split: {train_size} train, {val_size} val\n")
+
+                angle_model = AnglePredictor(num_points=1000)
+                angle_trainer = AnglePredictionTrainer(angle_model, device=device, lr=args.lr, patience=args.patience)
+
+                angle_trainer.train(train_loader, val_loader, epochs=args.epochs, checkpoint_dir=CHECKPOINT_DIR)
+
+                print(f"\n{'='*60}")
+                print(f"[+] Stage 1 Training Complete!")
+                print(f"[+] Angle predictor trained for rotation estimation")
+                print(f"{'='*60}\n")
     else:
-        print(f"\n[*] STAGE 1: Skipping Angle Predictor training\n")
+        print(f"\n[*] STAGE 1: Skipping Angle Predictor training")
         if not os.path.exists(ANGLES_NPZ):
             print(f"[!] Angles file not found. Cannot skip - must extract angles first")
             return
         else:
             print(f"[+] Using existing angles file: {ANGLES_NPZ}\n")
 
-    if os.path.exists(ANGLES_NPZ):
-        angle_dataset = AngleDataset(ANGLES_NPZ, num_points=1000)
-
-        if len(angle_dataset) == 0:
-            print(f"[!] No valid samples in angle dataset")
-        else:
-            train_size = int(0.8 * len(angle_dataset))
-            val_size = len(angle_dataset) - train_size
-
-            train_dataset, val_dataset = torch.utils.data.random_split(
-                angle_dataset,
-                [train_size, val_size],
-                generator=torch.Generator().manual_seed(42)
-            )
-
-            def collate_angle_fn(batch):
-                batch = [item for item in batch if item[0] is not None]
-                if len(batch) == 0:
-                    return None, None
-                points = torch.stack([item[0] for item in batch])
-                angles = torch.stack([item[1] for item in batch])
-                return points, angles
-
-            train_loader = DataLoader(
-                train_dataset,
-                batch_size=4,
-                shuffle=True,
-                num_workers=0,
-                collate_fn=collate_angle_fn
-            )
-            val_loader = DataLoader(
-                val_dataset,
-                batch_size=4,
-                shuffle=False,
-                num_workers=0,
-                collate_fn=collate_angle_fn
-            )
-
-            print(f"[*] Angle dataset split: {train_size} train, {val_size} val\n")
-
-            angle_model = AnglePredictor(num_points=1000)
-            angle_trainer = AnglePredictionTrainer(angle_model, device=device, lr=args.lr, patience=args.patience)
-
-            angle_trainer.train(train_loader, val_loader, epochs=args.epochs, checkpoint_dir=CHECKPOINT_DIR)
-
-            print(f"\n{'='*60}")
-            print(f"[+] Stage 1 Training Complete!")
-            print(f"[+] Angle predictor trained for rotation estimation")
-            print(f"{'='*60}\n")
-
-    # ==================== PHASE 2: Train Per-Vertex Classifier ====================
-    if not args.skip_cutting:
-        print(f"\n[*] PHASE 2: Training Distance Regressor (Scalar Cutting Distances)")
+    # ==================== PHASE 2: Train Boundary-Based Classifier ====================
+    # Skipping Phase 2A - using regional DGCNN models (Phase 2C) instead
+    if False:  # Disabled - boundary classifier no longer used
+        print(f"\n[*] PHASE 2A: Training Upper Boundary-Based Classifier")
         print(f"{'='*60}\n")
 
-        # Extract cutting distances if not already extracted
-        DISTANCE_NPZ = os.path.join(CHECKPOINT_DIR, "distance_dataset.npz")
-        if not os.path.exists(DISTANCE_NPZ):
-            print(f"[*] Distance dataset not found. Extracting from dataset...")
-            extraction_success = extract_distance_dataset(PLANE_BEFORE, PLANE_AFTER, DISTANCE_NPZ)
-            if not extraction_success:
-                print(f"[!] Distance extraction failed")
-                return
+        # Extract boundary-based classification dataset
+        UPPER_BOUNDARY_NPZ = os.path.join(CHECKPOINT_DIR, "upper_boundary_dataset.npz")
+        if not os.path.exists(UPPER_BOUNDARY_NPZ):
+            print(f"[*] Boundary dataset not found. Extracting...")
+            results = []
+            print(f"[*] Processing UPPER teeth only (boundary-based)...")
+            print(f"    Before: {UPPER_BEFORE} (exists: {os.path.exists(UPPER_BEFORE)})")
+            print(f"    After:  {UPPER_AFTER} (exists: {os.path.exists(UPPER_AFTER)})\n")
+
+            if os.path.exists(UPPER_BEFORE) and os.path.exists(UPPER_AFTER):
+                upper_files = sorted([f for f in os.listdir(UPPER_BEFORE) if f.endswith('.stl')])
+                upper_scan_ids = [f.replace('upper_before.stl', '').replace('_before.stl', '') for f in upper_files]
+                upper_scan_ids = sorted(upper_scan_ids, key=lambda x: int(x.replace('scan', '')))
+
+                for i, scan_id in enumerate(upper_scan_ids):
+                    before_path = os.path.join(UPPER_BEFORE, f"{scan_id}upper_before.stl")
+                    after_path = os.path.join(UPPER_AFTER, f"{scan_id}upper_after.stl")
+
+                    try:
+                        before_mesh = trimesh.load(before_path, force='mesh', process=False)
+                        after_mesh = trimesh.load(after_path, force='mesh', process=False)
+
+                        labels = extract_keep_remove_labels(before_mesh, after_mesh)
+
+                        results.append({
+                            'scan_id': f"upper_{scan_id}",
+                            'before_verts': before_mesh.vertices.copy(),
+                            'labels': labels,
+                        })
+
+                        kept_verts = np.sum(labels == 1)
+                        removed_verts = np.sum(labels == 0)
+                        print(f"  [{i+1}/{len(upper_scan_ids)}] {scan_id}: {kept_verts} kept, {removed_verts} removed")
+
+                    except Exception as e:
+                        print(f"  [{i+1}/{len(upper_scan_ids)}] {scan_id} - Error: {e}")
+
+            if results:
+                scan_ids_result = np.array([r['scan_id'] for r in results], dtype=object)
+                before_verts_list = np.array([r['before_verts'].copy() for r in results], dtype=object)
+                labels_list = np.array([r['labels'].copy() for r in results], dtype=object)
+
+                np.savez(
+                    UPPER_BOUNDARY_NPZ,
+                    scan_ids=scan_ids_result,
+                    before_verts_list=before_verts_list,
+                    labels=labels_list,
+                )
+                print(f"\n[+] Extracted {len(results)} upper teeth (boundary) → {UPPER_BOUNDARY_NPZ}\n")
         else:
-            print(f"[+] Using existing distance dataset file: {DISTANCE_NPZ}\n")
+            print(f"[+] Using existing boundary dataset: {UPPER_BOUNDARY_NPZ}\n")
+
+        BOUNDARY_NPZ = UPPER_BOUNDARY_NPZ
+
+        # Extract upper teeth cutting distances only (for backward compatibility, but not used in new approach)
+        UPPER_DISTANCE_NPZ = os.path.join(CHECKPOINT_DIR, "upper_distance_dataset.npz")
+        if not os.path.exists(UPPER_DISTANCE_NPZ):
+            print(f"[*] Upper distance dataset not found. Extracting...")
+            # Extract only upper teeth
+            results = []
+            print(f"[*] Processing UPPER teeth only...")
+            print(f"    Before: {UPPER_BEFORE} (exists: {os.path.exists(UPPER_BEFORE)})")
+            print(f"    After:  {UPPER_AFTER} (exists: {os.path.exists(UPPER_AFTER)})\n")
+
+            if os.path.exists(UPPER_BEFORE) and os.path.exists(UPPER_AFTER):
+                upper_files = sorted([f for f in os.listdir(UPPER_BEFORE) if f.endswith('.stl')])
+                upper_scan_ids = [f.replace('upper_before.stl', '').replace('_before.stl', '') for f in upper_files]
+                upper_scan_ids = sorted(upper_scan_ids, key=lambda x: int(x.replace('scan', '')))
+
+                for i, scan_id in enumerate(upper_scan_ids):
+                    before_path = os.path.join(UPPER_BEFORE, f"{scan_id}upper_before.stl")
+                    after_path = os.path.join(UPPER_AFTER, f"{scan_id}upper_after.stl")
+
+                    try:
+                        before_mesh = trimesh.load(before_path, force='mesh', process=False)
+                        after_mesh = trimesh.load(after_path, force='mesh', process=False)
+
+                        z_cut, x_left, x_right, y_back_left, y_back_center, y_back_right = extract_cutting_distances_from_planes(
+                            before_mesh, after_mesh, num_back_cuts=1
+                        )
+                        distances = np.array([z_cut, x_left, x_right, y_back_left, y_back_center, y_back_right], dtype=np.float32)
+
+                        results.append({
+                            'scan_id': f"upper_{scan_id}",
+                            'before_verts': before_mesh.vertices,
+                            'distances': distances,
+                        })
+
+                        print(f"  [{i+1}/{len(upper_scan_ids)}] {scan_id}: Z={z_cut:6.2f}mm, X_L={x_left:6.2f}mm, X_R={x_right:6.2f}mm, Y_B_L={y_back_left:6.2f}mm, Y_B_C={y_back_center:6.2f}mm, Y_B_R={y_back_right:6.2f}mm")
+
+                    except Exception as e:
+                        print(f"  [{i+1}/{len(upper_scan_ids)}] {scan_id} - Error: {e}")
+
+            if results:
+                scan_ids_result = np.array([r['scan_id'] for r in results], dtype=object)
+                before_verts_list = np.array([r['before_verts'].copy() for r in results], dtype=object)
+                distances_array = np.array([r['distances'] for r in results], dtype=np.float32)
+
+                np.savez(
+                    UPPER_DISTANCE_NPZ,
+                    scan_ids=scan_ids_result,
+                    before_verts_list=before_verts_list,
+                    distances=distances_array,
+                )
+                print(f"\n[+] Extracted {len(results)} upper teeth → {UPPER_DISTANCE_NPZ}\n")
+        else:
+            print(f"[+] Using existing upper distance dataset: {UPPER_DISTANCE_NPZ}\n")
+
+        DISTANCE_NPZ = UPPER_DISTANCE_NPZ
 
         if os.path.exists(DISTANCE_NPZ):
             # Load distance dataset
@@ -1990,134 +2576,456 @@ def main():
                 val_indices = list(range(train_size, num_samples))
 
                 print(f"[*] Dataset split: {train_size} train, {val_size} val")
-                print(f"[*] Training distance regressor for scalar cutting distances...\n")
+                print(f"[*] Skipping scalar distance regressor (using regional models only)\n")
 
-                # Collate function for regression
-                def collate_distance_fn(batch_indices):
-                    batch_points = []
-                    batch_distances = []
+        # ==================== Per-Vertex Distance Regressor Training ====================
+        if os.path.exists(BOUNDARY_NPZ):
+            print(f"\n[*] PHASE 2A-BOUNDARY: Training Boundary-Based Keep/Remove Classifier")
+            print(f"{'='*60}\n")
 
-                    for idx in batch_indices:
-                        try:
-                            verts = data['vertices_list'][idx]
-                            distances = data['distances'][idx]
+            data = np.load(BOUNDARY_NPZ, allow_pickle=True)
+            num_samples = len(data['scan_ids'])
 
-                            if len(verts) < 10:
-                                continue
+            if num_samples == 0:
+                print(f"[!] No valid samples in boundary dataset")
+            else:
+                train_size = max(1, int(0.8 * num_samples))
+                val_size = num_samples - train_size
+                train_indices = list(range(train_size))
+                val_indices = list(range(train_size, num_samples))
 
-                            # Sample 1000 points if more available
-                            if len(verts) > 1000:
-                                sample_idx = np.random.choice(len(verts), 1000, replace=False)
+                print(f"[*] Dataset split: {train_size} train, {val_size} val")
+                print(f"[*] Skipping boundary classifier (using regional models only)\n")
+
+    # ==================== REGIONAL MODELS: DGCNN + Augmentation ====================
+    print(f"\n[*] PHASE 2C: Training Regional (Left/Right) DGCNN Distance Regressors")
+    print(f"{'='*60}")
+    print(f"[*] Architecture: DGCNN with dynamic graph convolutions")
+    if args.no_augment:
+        print(f"[*] Augmentation: OFF (1x base dataset)")
+    else:
+        print(f"[*] Augmentation: ON (5x training set expansion)")
+    print(f"{'='*60}\n")
+
+    for region in ['left', 'right']:
+        REGIONAL_NPZ = os.path.join(CHECKPOINT_DIR, f"upper_{region}_distance_dataset.npz")
+        if not os.path.exists(REGIONAL_NPZ):
+            print(f"[*] {region.capitalize()} region dataset not found. Extracting...")
+            results = []
+
+            if os.path.exists(UPPER_BEFORE) and os.path.exists(UPPER_AFTER):
+                upper_files = sorted([f for f in os.listdir(UPPER_BEFORE) if f.endswith('.stl')])
+                upper_scan_ids = [f.replace('upper_before.stl', '').replace('_before.stl', '') for f in upper_files]
+                upper_scan_ids = sorted(upper_scan_ids, key=lambda x: int(x.replace('scan', '')))
+
+                for i, scan_id in enumerate(upper_scan_ids):
+                    before_path = os.path.join(UPPER_BEFORE, f"{scan_id}upper_before.stl")
+                    after_path = os.path.join(UPPER_AFTER, f"{scan_id}upper_after.stl")
+
+                    try:
+                        before_mesh = trimesh.load(before_path, force='mesh', process=False)
+                        after_mesh = trimesh.load(after_path, force='mesh', process=False)
+
+                        distances = extract_boundary_based_cutting_distances(before_mesh, after_mesh, region=region)
+
+                        results.append({
+                            'scan_id': f"upper_{scan_id}",
+                            'before_verts': before_mesh.vertices.copy(),
+                            'distances': distances,
+                        })
+
+                        x_param = distances[1] if region == 'left' else distances[2]
+                        y_back = distances[3] if region == 'left' else distances[5]
+                        print(f"  [{i+1}/{len(upper_scan_ids)}] {scan_id}: Z={distances[0]:.2f}mm, X={x_param:.2f}mm, Y_back={y_back:.2f}mm")
+
+                    except Exception as e:
+                        print(f"  [{i+1}/{len(upper_scan_ids)}] {scan_id} - Error: {e}")
+
+            if results:
+                scan_ids_result = np.array([r['scan_id'] for r in results], dtype=object)
+                before_verts_list = np.array([r['before_verts'].copy() for r in results], dtype=object)
+                distances_array = np.array([r['distances'] for r in results], dtype=np.float32)
+
+                np.savez(
+                    REGIONAL_NPZ,
+                    scan_ids=scan_ids_result,
+                    before_verts_list=before_verts_list,
+                    distances=distances_array,
+                )
+                print(f"\n[+] Extracted {len(results)} {region} region samples → {REGIONAL_NPZ}\n")
+        else:
+            print(f"[+] Using existing {region} region dataset: {REGIONAL_NPZ}\n")
+
+        if os.path.exists(REGIONAL_NPZ):
+            # Create dataset wrapper - loads data on-demand to save RAM
+            num_base_samples = None  # Will be set from dataset
+            class RegionalDataset(Dataset):
+                def __init__(self, npz_path, region, num_points=500, augment=True):
+                    """Load dataset from NPZ file on-demand to save RAM."""
+                    self.npz_path = npz_path
+                    self.region = region
+                    self.num_points = num_points
+                    self.augment = augment
+
+                    # Load only metadata, not the actual data
+                    data = np.load(npz_path, allow_pickle=True)
+                    self.num_base_samples = len(data['scan_ids'])
+                    self.distances = np.array(data['distances'], dtype=np.float32)
+
+                    # Extract only relevant 3 values per region: [Z, X, Y_back]
+                    distances_full = self.distances  # (N, 6)
+                    if region == 'left':
+                        self.distances = distances_full[:, [0, 1, 3]]  # Z, X_left, Y_back_left
+                    else:  # right
+                        self.distances = distances_full[:, [0, 2, 5]]  # Z, X_right, Y_back_right
+
+                    del data
+
+                def __len__(self):
+                    return self.num_base_samples * (5 if self.augment else 1)
+
+                def __getitem__(self, idx):
+                    base_idx = idx // (5 if self.augment else 1)
+
+                    # Load only this one sample from NPZ
+                    data = np.load(self.npz_path, allow_pickle=True)
+                    verts = data['before_verts_list'][base_idx].copy()
+                    del data
+
+                    if len(verts) > self.num_points:
+                        sample_idx = np.random.choice(len(verts), self.num_points, replace=False)
+                        verts = verts[sample_idx]
+
+                    if self.augment:
+                        verts = augment_point_cloud(verts)
+
+                    centroid = verts.mean(axis=0)
+                    verts_centered = verts - centroid
+                    max_dist = np.max(np.linalg.norm(verts_centered, axis=1))
+                    if max_dist > 0:
+                        verts_norm = verts_centered / max_dist
+                    else:
+                        verts_norm = verts_centered
+
+                    distances = self.distances[base_idx]
+                    return torch.from_numpy(verts_norm).float(), torch.from_numpy(distances).float()
+
+            train_dataset = RegionalDataset(REGIONAL_NPZ, region, num_points=500, augment=not args.no_augment)
+            num_base_samples = train_dataset.num_base_samples
+            num_augmented = len(train_dataset)
+
+            train_size = max(1, int(0.8 * num_augmented))
+            val_size = num_augmented - train_size
+
+            train_indices = list(range(train_size))
+            val_indices = list(range(train_size, num_augmented))
+
+            train_subset = Subset(train_dataset, train_indices)
+            val_subset = Subset(train_dataset, val_indices)
+
+            train_loader = DataLoader(train_subset, batch_size=2, shuffle=True, drop_last=False)
+            val_loader = DataLoader(val_subset, batch_size=2, shuffle=False)
+
+            print(f"[*] Training {region.upper()} regional model (DGCNN)...")
+            print(f"[*] Base samples: {num_base_samples} → Augmented: {num_augmented}")
+            print(f"[*] Dataset split: {train_size} train, {val_size} val")
+            print(f"[*] Outputs: [Z-cut, X-cut, Y-back]\n")
+
+            model = DGCNNDistanceRegressor(num_points=500, k=20, num_outputs=3)
+            trainer = CuttingDistanceTrainer(model, device=device, lr=args.lr, patience=args.patience, region=region)
+
+            for epoch in range(args.epochs):
+                train_loss = trainer.train_epoch(train_loader)
+                val_loss = trainer.validate(val_loader)
+                trainer.scheduler.step(val_loss)
+
+                trainer.history['train_loss'].append(train_loss)
+                trainer.history['val_loss'].append(val_loss)
+
+                print(f"Epoch {epoch+1}/{args.epochs} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+
+                if val_loss < trainer.best_loss:
+                    trainer.best_loss = val_loss
+                    trainer.patience_counter = 0
+                    torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, f"{region}_distance_regressor.pt"))
+                    print(f"  [+] Best model saved (loss: {val_loss:.4f})")
+                else:
+                    trainer.patience_counter += 1
+                    if trainer.patience_counter >= args.patience:
+                        print(f"[*] Early stopping at epoch {epoch+1}\n")
+                        break
+
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            print(f"[+] {region.upper()} Regional Model Training Complete!\n")
+
+    # ==================== PHASE 2B: Train Lower Teeth Distance Regressor ====================
+    if not args.skip_lower and not args.lower_only:
+        print(f"\n[*] PHASE 2B: Training Lower Teeth Distance Regressor (Single Z-Cut)")
+        print(f"{'='*60}\n")
+
+        LOWER_DISTANCE_NPZ = os.path.join(CHECKPOINT_DIR, "lower_distance_dataset.npz")
+        if not os.path.exists(LOWER_DISTANCE_NPZ):
+            print(f"[*] Lower distance dataset not found. Extracting...")
+            extraction_success = extract_lower_cutting_dataset(
+                LOWER_BEFORE, LOWER_AFTER,
+                LOWER_DISTANCE_NPZ
+            )
+            if not extraction_success:
+                print(f"[!] Lower distance extraction failed")
+            else:
+                # Train lower regressor
+                data = np.load(LOWER_DISTANCE_NPZ, allow_pickle=True)
+                num_samples = len(data['scan_ids'])
+
+                if num_samples > 0:
+                    train_size = max(1, int(0.8 * num_samples))
+                    val_size = num_samples - train_size
+
+                    print(f"[*] Dataset split: {train_size} train, {val_size} val")
+                    print(f"[*] Training lower teeth DGCNN model...\n")
+
+                    # Load dataset with on-demand loading
+                    class LowerDataset(Dataset):
+                        def __init__(self, npz_path, num_points=500, augment=True):
+                            self.npz_path = npz_path
+                            self.num_points = num_points
+                            self.augment = augment
+
+                            data = np.load(npz_path, allow_pickle=True)
+                            self.num_base_samples = len(data['scan_ids'])
+                            del data
+
+                        def __len__(self):
+                            return self.num_base_samples * (5 if self.augment else 1)
+
+                        def __getitem__(self, idx):
+                            base_idx = idx // (5 if self.augment else 1)
+
+                            data = np.load(self.npz_path, allow_pickle=True)
+                            verts = data['before_verts_list'][base_idx].copy()
+                            distances = data['distances'][base_idx].copy()
+                            del data
+
+                            if len(verts) > self.num_points:
+                                sample_idx = np.random.choice(len(verts), self.num_points, replace=False)
                                 verts = verts[sample_idx]
 
-                            points_tensor = torch.from_numpy(verts).float()
-                            dist_tensor = torch.from_numpy(distances).float()
+                            if self.augment:
+                                verts = augment_point_cloud(verts)
 
-                            batch_points.append(points_tensor)
-                            batch_distances.append(dist_tensor)
-                        except:
+                            centroid = verts.mean(axis=0)
+                            verts_centered = verts - centroid
+                            max_dist = np.max(np.linalg.norm(verts_centered, axis=1))
+                            if max_dist > 0:
+                                verts_norm = verts_centered / max_dist
+                            else:
+                                verts_norm = verts_centered
+
+                            # Pad distances to [Z, 0, 0] to match model output shape (3 values)
+                            distances_padded = np.zeros(3, dtype=np.float32)
+                            distances_padded[0] = distances[0] if isinstance(distances, np.ndarray) else distances
+
+                            return torch.from_numpy(verts_norm).float(), torch.from_numpy(distances_padded).float()
+
+                    train_dataset = LowerDataset(LOWER_DISTANCE_NPZ, num_points=500, augment=not args.no_augment)
+                    num_augmented = len(train_dataset)
+
+                    train_size_aug = max(1, int(0.8 * num_augmented))
+                    val_size_aug = num_augmented - train_size_aug
+
+                    train_indices = list(range(train_size_aug))
+                    val_indices = list(range(train_size_aug, num_augmented))
+
+                    train_subset = Subset(train_dataset, train_indices)
+                    val_subset = Subset(train_dataset, val_indices)
+
+                    train_loader = DataLoader(train_subset, batch_size=2, shuffle=True, drop_last=False)
+                    val_loader = DataLoader(val_subset, batch_size=2, shuffle=False)
+
+                    # Train lower distance regressor using DGCNN
+                    model = DGCNNDistanceRegressor(num_points=500, k=20, num_outputs=3)
+                    trainer = CuttingDistanceTrainer(model, device=device, lr=args.lr, patience=args.patience, region='lower')
+
+                    for epoch in range(args.epochs):
+                        train_loss = trainer.train_epoch(train_loader)
+                        val_loss = trainer.validate(val_loader)
+                        trainer.scheduler.step(val_loss)
+
+                        trainer.history['train_loss'].append(train_loss)
+                        trainer.history['val_loss'].append(val_loss)
+
+                        print(f"Epoch {epoch+1}/{args.epochs} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+
+                        if val_loss < trainer.best_loss:
+                            trainer.best_loss = val_loss
+                            trainer.patience_counter = 0
+                            torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, "lower_distance_regressor.pt"))
+                            print(f"  [+] Best model saved (loss: {val_loss:.4f})")
+                        else:
+                            trainer.patience_counter += 1
+                            if trainer.patience_counter >= args.patience:
+                                print(f"[*] Early stopping at epoch {epoch+1}\n")
+                                break
+
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+
+                    print(f"\n{'='*60}")
+                    print(f"[+] Phase 2B Training Complete!")
+                    print(f"[+] Lower teeth DGCNN model trained")
+                    print(f"[+] Model predicts: [Z-cut, X, Y-back] in mm")
+                    print(f"{'='*60}\n")
+
+    elif args.lower_only:
+        print(f"\n[*] LOWER-ONLY MODE: Training lower teeth distance regressor")
+        print(f"{'='*60}\n")
+
+        LOWER_DISTANCE_NPZ = os.path.join(CHECKPOINT_DIR, "lower_distance_dataset.npz")
+        if not os.path.exists(LOWER_DISTANCE_NPZ):
+            extraction_success = extract_lower_cutting_dataset(LOWER_BEFORE, LOWER_AFTER, LOWER_DISTANCE_NPZ)
+            if not extraction_success:
+                print(f"[!] Lower distance extraction failed")
+                return
+
+        # Load and train lower regressor
+        data = np.load(LOWER_DISTANCE_NPZ, allow_pickle=True)
+        num_samples = len(data['scan_ids'])
+
+        if num_samples > 0:
+            train_size = max(1, int(0.8 * num_samples))
+            val_size = num_samples - train_size
+
+            print(f"[*] Dataset split: {train_size} train, {val_size} val")
+            print(f"[*] Training lower teeth distance regressor...\n")
+
+            # Collate function
+            def collate_lower_fn(batch_indices):
+                batch_points = []
+                batch_distances = []
+
+                for idx in batch_indices:
+                    try:
+                        verts = data['before_verts_list'][idx]
+                        distances = data['distances'][idx]
+
+                        if len(verts) < 10:
                             continue
 
-                    if len(batch_points) == 0:
-                        return None, None
+                        if len(verts) > 1000:
+                            sample_idx = np.random.choice(len(verts), 1000, replace=False)
+                            verts = verts[sample_idx]
 
-                    # Pad to same size
-                    max_pts = max([p.shape[0] for p in batch_points])
-                    padded_points = []
-                    for pts in batch_points:
-                        if pts.shape[0] < max_pts:
-                            pad_size = max_pts - pts.shape[0]
-                            pts = torch.cat([pts, torch.zeros(pad_size, 3)], dim=0)
-                        padded_points.append(pts)
+                        points_tensor = torch.from_numpy(verts).float()
+                        dist_tensor = torch.from_numpy(distances).float()
 
-                    points = torch.stack(padded_points)[:, :1000, :]
-                    distances = torch.stack(batch_distances)
-                    return points, distances
+                        batch_points.append(points_tensor)
+                        batch_distances.append(dist_tensor)
+                    except:
+                        continue
 
-                # Train distance regressor
-                model = DistanceRegressor(num_points=1000)
-                model.to(device)
-                optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-                scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.7)
-                criterion = nn.MSELoss()
+                if len(batch_points) == 0:
+                    return None, None
 
-                best_val_loss = float('inf')
-                patience_counter = 0
+                max_pts = max([p.shape[0] for p in batch_points])
+                padded_points = []
+                for pts in batch_points:
+                    if pts.shape[0] < max_pts:
+                        pad_size = max_pts - pts.shape[0]
+                        pts = torch.cat([pts, torch.zeros(pad_size, 3)], dim=0)
+                    padded_points.append(pts)
 
-                for epoch in range(args.epochs):
-                    # Training
-                    model.train()
-                    train_loss_total = 0
-                    train_count = 0
+                points = torch.stack(padded_points)[:, :1000, :]
+                distances = torch.stack(batch_distances)
+                return points, distances
 
-                    for batch_idx in tqdm(range(0, len(train_indices), 4), desc=f"Epoch {epoch+1}/{args.epochs} Train"):
-                        batch_indices = train_indices[batch_idx:batch_idx+4]
-                        points, distances = collate_distance_fn(batch_indices)
+            # Train lower distance regressor
+            model = LowerDistanceRegressor(num_points=1000)
+            model.to(device)
+            optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.7)
+            criterion = nn.MSELoss()
+
+            best_val_loss = float('inf')
+            patience_counter = 0
+
+            for epoch in range(args.epochs):
+                model.train()
+                train_loss_total = 0
+                train_count = 0
+
+                for start_idx in range(0, train_size, 8):
+                    end_idx = min(start_idx + 8, train_size)
+                    batch_indices = list(range(start_idx, end_idx))
+
+                    points, distances = collate_lower_fn(batch_indices)
+                    if points is None:
+                        continue
+
+                    points = points.to(device)
+                    distances = distances.to(device)
+
+                    pred_distances = model(points)
+                    loss = criterion(pred_distances[:, :1], distances)
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+
+                    train_loss_total += loss.item()
+                    train_count += 1
+
+                model.eval()
+                val_loss_total = 0
+                val_count = 0
+
+                with torch.no_grad():
+                    for start_idx in range(train_size, num_samples, 8):
+                        end_idx = min(start_idx + 8, num_samples)
+                        batch_indices = list(range(start_idx, end_idx))
+
+                        points, distances = collate_lower_fn(batch_indices)
                         if points is None:
                             continue
 
                         points = points.to(device)
                         distances = distances.to(device)
 
-                        optimizer.zero_grad()
                         pred_distances = model(points)
-                        loss = criterion(pred_distances, distances)
-                        loss.backward()
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                        optimizer.step()
+                        loss = criterion(pred_distances[:, :1], distances)
+                        val_loss_total += loss.item()
+                        val_count += 1
 
-                        train_loss_total += loss.item()
-                        train_count += 1
+                avg_train_loss = train_loss_total / max(1, train_count)
+                avg_val_loss = val_loss_total / max(1, val_count)
 
-                    # Validation
-                    model.eval()
-                    val_loss_total = 0
-                    val_count = 0
+                print(f"Epoch {epoch+1}/{args.epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
 
-                    with torch.no_grad():
-                        for batch_idx in range(0, len(val_indices), 4):
-                            batch_indices = val_indices[batch_idx:batch_idx+4]
-                            points, distances = collate_distance_fn(batch_indices)
-                            if points is None:
-                                continue
+                if avg_val_loss < best_val_loss:
+                    best_val_loss = avg_val_loss
+                    patience_counter = 0
+                    torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, "lower_distance_regressor.pt"))
+                    print(f"  [+] Best model saved (Loss: {avg_val_loss:.4f}mm)")
+                else:
+                    patience_counter += 1
+                    if patience_counter >= args.patience:
+                        print(f"[*] Early stopping at epoch {epoch+1}")
+                        break
 
-                            points = points.to(device)
-                            distances = distances.to(device)
+                scheduler.step()
 
-                            pred_distances = model(points)
-                            loss = criterion(pred_distances, distances)
-                            val_loss_total += loss.item()
-                            val_count += 1
-
-                    avg_train_loss = train_loss_total / max(1, train_count)
-                    avg_val_loss = val_loss_total / max(1, val_count)
-
-                    print(f"Epoch {epoch+1}/{args.epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
-
-                    if avg_val_loss < best_val_loss:
-                        best_val_loss = avg_val_loss
-                        patience_counter = 0
-                        torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, "distance_regressor.pt"))
-                        print(f"  [+] Best model saved (MAE: {avg_val_loss:.4f}mm)")
-                    else:
-                        patience_counter += 1
-                        if patience_counter >= args.patience:
-                            print(f"[*] Early stopping at epoch {epoch+1}")
-                            break
-
-                    scheduler.step()
-
-                print(f"\n{'='*60}")
-                print(f"[+] Phase 2 Training Complete!")
-                print(f"[+] Distance regressor trained for scalar cutting distances")
-                print(f"[+] Model predicts: [Z_cut, X_left, X_right, Y_back] in mm")
-                print(f"{'='*60}\n")
+            print(f"\n{'='*60}")
+            print(f"[+] Lower Teeth Training Complete!")
+            print(f"[+] Lower distance regressor trained (Z-cut only)")
+            print(f"{'='*60}\n")
 
     print(f"{'='*60}")
     print(f"[+] Full Training Pipeline Complete!")
-    print(f"[+] Order: Phase 1 (PointNet) → Stage 1 (Angle) → Phase 2 (Distance Regression)")
+    print(f"[+] Upper: Phase 1 (PointNet) → Stage 1 (Angle) → Phase 2 (4-cut Distance)")
+    print(f"[+] Lower: Phase 1 (PointNet) → Phase 2B (Z-cut Distance)")
     print(f"[+] Models saved to {CHECKPOINT_DIR}")
-    print(f"[+] Phase 2: Scalar regression for flat cutting distances")
     print(f"{'='*60}")
 
 
