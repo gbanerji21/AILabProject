@@ -1,7 +1,7 @@
 # Dental Arch Retainer Generation Pipeline
 
 ML-based pipeline for automatic generation of dental retainers from 3D tooth meshes. Uses deep learning (PointNet, DGCNN) to segment dental arches, predict rotation alignment, and compute trimming distances for flat, precision cuts.
-
+**NOTE** All files are paths from my personal computer which has a linux file system, you will have to adjust them according to your computer and where you decide to store this project.
 ## Pipeline Overview
 
 **Stage 1: Angle Prediction**
