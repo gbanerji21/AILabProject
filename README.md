@@ -48,7 +48,7 @@ pip install -r requirements.txt
 ### File Conversion
 Run the following command in the 3D Slicer Python Console using the path you put the project in (this could look different based on whether or not you are on windows, mac or linux.
 ```
-exec(open('/path/to//project/slicerconversion.py').read())
+exec(open('/path/to/project/slicerconversion.py').read())
 ```
 ### Training
 
